@@ -1,0 +1,542 @@
+# -*- coding: utf-8 -*-
+# ==========================================================
+# French EURO CPI Model — Dash
+# - Data: pandas DataFrame "Data" with 5 inputs + target y
+# - Two tabs: Simple OLS, Polynomial OLS (degree 2 optimized)
+# - Window selector: MAX/2Y/1Y/6M/3M
+# - User overrides: if empty -> use latest; flag if |override-latest| > 20
+# - Displays: scenario prediction + latest actual + inputs used (with source)
+# - Model panel: R², coefficients, p-values (DataTable)
+# - Plots: Actual vs Predicted + Residuals; scenario point at today
+# ==========================================================
+
+import numpy as np
+import pandas as pd
+
+import dash
+from dash import Dash, dcc, html, Input, Output, State, callback, dash_table
+import plotly.graph_objects as go
+from dateutil.relativedelta import relativedelta
+
+import statsmodels.api as sm
+
+
+# -----------------------------
+# REQUIRED: your dataframe "Data"
+# -----------------------------
+# Data must contain the following columns (you can rename below):
+#   X1: "Realized frxt"
+#   X2: "% DV01 OATi"
+#   X3: "Livret A net inflows"
+#   X4: "PMI"
+#   X5: "Roll Down (bps)"
+#   y : "5y frxt"
+#
+# Data must have a DatetimeIndex OR a column named "Date".
+#
+# Example (commented):
+# Data = pd.read_csv("your_file.csv")
+# Data["Date"] = pd.to_datetime(Data["Date"])
+# Data = Data.set_index("Date").sort_index()
+
+# -----------------------------
+# Column config (edit if needed)
+# -----------------------------
+COL_DATE = "Date"  # only used if Data index is not datetime
+Y_COL = "5y frxt"
+
+X_COLS = [
+    "Realized frxt",
+    "% DV01 OATi",
+    "Livret A net inflows",
+    "PMI",
+    "Roll Down (bps)",
+]
+
+# Override warning threshold
+OVERRIDE_FLAG_DIFF = 20.0
+
+# Window options
+WINDOWS = {
+    "MAX": None,
+    "2Y": relativedelta(years=2),
+    "1Y": relativedelta(years=1),
+    "6M": relativedelta(months=6),
+    "3M": relativedelta(months=3),
+}
+
+FIG_HEIGHT = 520
+
+
+# =========================
+# Helpers
+# =========================
+def _ensure_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
+    if isinstance(df.index, pd.DatetimeIndex):
+        return df.sort_index()
+    if COL_DATE in df.columns:
+        out = df.copy()
+        out[COL_DATE] = pd.to_datetime(out[COL_DATE], errors="coerce")
+        out = out.dropna(subset=[COL_DATE]).set_index(COL_DATE).sort_index()
+        return out
+    raise ValueError("Data must have a DatetimeIndex or a 'Date' column.")
+
+
+def _window_slice(df: pd.DataFrame, window_key: str) -> pd.DataFrame:
+    df = df.sort_index()
+    delta = WINDOWS.get(window_key, None)
+    if delta is None:
+        return df
+    end = df.index.max()
+    start = end - delta
+    return df.loc[df.index >= start]
+
+
+def _clean_xy(df: pd.DataFrame):
+    use_cols = X_COLS + [Y_COL]
+    missing = [c for c in use_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns in Data: {missing}")
+    sub = df[use_cols].copy()
+    for c in use_cols:
+        sub[c] = pd.to_numeric(sub[c], errors="coerce")
+    sub = sub.dropna()
+    return sub
+
+
+def _latest_row(df: pd.DataFrame) -> pd.Series:
+    return df.sort_index().iloc[-1]
+
+
+def _build_scenario_inputs(latest: pd.Series, overrides: dict):
+    """
+    overrides values can be None; if present use them; else latest.
+    Returns: scenario_x (dict), meta (dict with source+flag)
+    """
+    scenario = {}
+    meta = {}
+    for col in X_COLS:
+        ov = overrides.get(col, None)
+        last = float(latest[col])
+        if ov is None or (isinstance(ov, str) and ov.strip() == ""):
+            scenario[col] = last
+            meta[col] = {"source": "Latest Available Data", "flag": False, "latest": last, "used": last}
+        else:
+            ovf = float(ov)
+            scenario[col] = ovf
+            meta[col] = {
+                "source": "Overridden",
+                "flag": (abs(ovf - last) > OVERRIDE_FLAG_DIFF),
+                "latest": last,
+                "used": ovf
+            }
+    return scenario, meta
+
+
+def _ols_fit(df_window: pd.DataFrame):
+    """
+    OLS on X_COLS -> Y_COL.
+    Returns: model (statsmodels), predictions aligned to df_window index
+    """
+    X = df_window[X_COLS].astype(float)
+    y = df_window[Y_COL].astype(float)
+    Xc = sm.add_constant(X)
+    model = sm.OLS(y, Xc).fit()
+    yhat = model.predict(Xc)
+    return model, yhat
+
+
+def _poly_feature_sets(df_window: pd.DataFrame):
+    """
+    Generate candidate degree-2 feature matrices (all OLS-compatible with p-values).
+    We try:
+      A) linear only
+      B) linear + squares
+      C) linear + squares + pairwise interactions
+    Choose best by max R² (in-sample) over the selected window.
+    """
+    X = df_window[X_COLS].astype(float).copy()
+
+    # Base
+    feats_A = X.copy()
+    names_A = list(feats_A.columns)
+
+    # Squares
+    feats_B = X.copy()
+    for c in X_COLS:
+        feats_B[f"{c}^2"] = X[c] ** 2
+    names_B = list(feats_B.columns)
+
+    # Squares + interactions
+    feats_C = feats_B.copy()
+    for i in range(len(X_COLS)):
+        for j in range(i + 1, len(X_COLS)):
+            ci, cj = X_COLS[i], X_COLS[j]
+            feats_C[f"{ci}*{cj}"] = X[ci] * X[cj]
+    names_C = list(feats_C.columns)
+
+    return [
+        ("Degree-2 (linear)", feats_A, names_A),
+        ("Degree-2 (+squares)", feats_B, names_B),
+        ("Degree-2 (+squares+interactions)", feats_C, names_C),
+    ]
+
+
+def _poly_fit_best(df_window: pd.DataFrame):
+    """
+    Fit the best degree-2 OLS (by max R² among candidate feature sets).
+    Returns: (label, model, yhat, feature_names, X_design_with_const)
+    """
+    y = df_window[Y_COL].astype(float)
+    best = None
+
+    for label, feats, names in _poly_feature_sets(df_window):
+        Xc = sm.add_constant(feats.astype(float))
+        model = sm.OLS(y, Xc).fit()
+        r2 = float(model.rsquared) if np.isfinite(model.rsquared) else -np.inf
+        if (best is None) or (r2 > best["r2"]):
+            best = {
+                "label": label,
+                "model": model,
+                "Xc": Xc,
+                "yhat": model.predict(Xc),
+                "names": names,
+                "r2": r2,
+            }
+
+    return best["label"], best["model"], best["yhat"], best["names"], best["Xc"]
+
+
+def _scenario_predict_from_model(model, scenario_x: dict, feature_names=None, poly_kind=None):
+    """
+    Predict y for a single scenario.
+    - Simple OLS: const + X_COLS
+    - Poly OLS: const + features according to poly_kind/feature_names
+    """
+    if poly_kind is None:
+        row = {**scenario_x}
+        X1 = pd.DataFrame([row], columns=X_COLS).astype(float)
+        Xc = sm.add_constant(X1)
+        return float(model.predict(Xc).iloc[0])
+
+    # poly
+    X_base = pd.DataFrame([scenario_x], columns=X_COLS).astype(float)
+    if poly_kind == "Degree-2 (linear)":
+        feats = X_base.copy()
+
+    elif poly_kind == "Degree-2 (+squares)":
+        feats = X_base.copy()
+        for c in X_COLS:
+            feats[f"{c}^2"] = X_base[c] ** 2
+
+    else:
+        # squares + interactions
+        feats = X_base.copy()
+        for c in X_COLS:
+            feats[f"{c}^2"] = X_base[c] ** 2
+        for i in range(len(X_COLS)):
+            for j in range(i + 1, len(X_COLS)):
+                ci, cj = X_COLS[i], X_COLS[j]
+                feats[f"{ci}*{cj}"] = X_base[ci] * X_base[cj]
+
+    # Ensure column order matches model
+    feats = feats.reindex(columns=feature_names, fill_value=0.0)
+    Xc = sm.add_constant(feats)
+    return float(model.predict(Xc).iloc[0])
+
+
+def _fig_pred_vs_actual(dates, actual, pred, scenario_date, scenario_pred):
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=dates, y=actual, mode="lines", name="Actual"))
+    fig.add_trace(go.Scatter(x=dates, y=pred, mode="lines", name="Model prediction"))
+
+    # Scenario point at today
+    fig.add_trace(go.Scatter(
+        x=[scenario_date], y=[scenario_pred],
+        mode="markers", name="Scenario (today)",
+        marker=dict(size=12, color="crimson", line=dict(width=1, color="black"))
+    ))
+
+    fig.update_layout(
+        template="plotly_white",
+        height=FIG_HEIGHT,
+        title="Model prediction vs Actual",
+        xaxis_title="Date",
+        yaxis_title=Y_COL,
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    return fig
+
+
+def _fig_residuals(dates, resid):
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=dates, y=resid, mode="lines", name="Residual"))
+    fig.update_layout(
+        template="plotly_white",
+        height=FIG_HEIGHT,
+        title="Residuals (Actual − Predicted)",
+        xaxis_title="Date",
+        yaxis_title="Residual",
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    return fig
+
+
+def _model_table_from_sm(model) -> list[dict]:
+    """
+    Build rows: Variable | Coef | P-value
+    """
+    params = model.params
+    pvals = model.pvalues
+    rows = []
+    for name in params.index:
+        rows.append({
+            "Variable": name,
+            "Coefficient": float(params.loc[name]),
+            "P-value": float(pvals.loc[name]) if name in pvals.index else np.nan,
+        })
+    return rows
+
+
+def _fmt_num(x, nd=4):
+    if x is None or not np.isfinite(x):
+        return ""
+    return f"{float(x):.{nd}f}"
+
+
+# =========================
+# Dash app
+# =========================
+app: Dash = dash.Dash(__name__, suppress_callback_exceptions=True)
+app.title = "French EURO CPI Model"
+
+
+def make_input_row(label: str, id_: str, placeholder: str = "Leave blank to use latest"):
+    return html.Div(
+        [
+            html.Label(label, style={"fontWeight": 600}),
+            dcc.Input(
+                id=id_,
+                type="number",
+                placeholder=placeholder,
+                debounce=True,
+                style={"width": "100%", "padding": "8px", "borderRadius": "10px", "border": "1px solid #dfe6f3"},
+            ),
+        ],
+        style={"width": "19%", "minWidth": "220px"},
+    )
+
+
+app.layout = html.Div(
+    [
+        html.H1("French EURO CPI Model", style={"marginBottom": "6px"}),
+        html.Div(
+            "Enter overrides (optional). If a field is blank, the model uses the latest available value for that input.",
+            style={"color": "#555", "marginBottom": "14px"},
+        ),
+
+        # Overrides row
+        html.Div(
+            [
+                make_input_row("Realized frxt", "ov_realized"),
+                make_input_row("% DV01 OATi issued", "ov_dv01"),
+                make_input_row("Livret A net inflows", "ov_livret"),
+                make_input_row("PMI", "ov_pmi"),
+                make_input_row("Roll Down (bps)", "ov_roll"),
+            ],
+            style={"display": "flex", "gap": "12px", "flexWrap": "wrap", "marginBottom": "14px"},
+        ),
+
+        # Window selector
+        html.Div(
+            [
+                html.Label("Regression window", style={"fontWeight": 700, "marginRight": "10px"}),
+                dcc.RadioItems(
+                    id="window",
+                    options=[{"label": k, "value": k} for k in WINDOWS.keys()],
+                    value="MAX",
+                    inline=True,
+                ),
+            ],
+            style={"marginBottom": "12px"},
+        ),
+
+        # Tabs
+        dcc.Tabs(
+            id="tab",
+            value="TAB_SIMPLE",
+            children=[
+                dcc.Tab(label="Simple Multi-Regression", value="TAB_SIMPLE"),
+                dcc.Tab(label="Polynomial Regression (degree 2, optimized)", value="TAB_POLY"),
+            ],
+        ),
+
+        # Content
+        html.Div(id="content", style={"marginTop": "12px"}),
+    ],
+    style={"padding": "16px 18px"},
+)
+
+
+@callback(
+    Output("content", "children"),
+    Input("tab", "value"),
+    Input("window", "value"),
+    Input("ov_realized", "value"),
+    Input("ov_dv01", "value"),
+    Input("ov_livret", "value"),
+    Input("ov_pmi", "value"),
+    Input("ov_roll", "value"),
+)
+def render(tab, window_key, ov_realized, ov_dv01, ov_livret, ov_pmi, ov_roll):
+    # ---- Load & prep data
+    try:
+        df = _ensure_datetime_index(Data)
+        dfw = _window_slice(df, window_key)
+        dfw = _clean_xy(dfw)
+    except Exception as e:
+        return html.Div(
+            f"Data error: {e}",
+            style={"background": "#ffe8e8", "border": "1px solid #ff6b6b", "padding": "10px", "borderRadius": "10px"},
+        )
+
+    if dfw.shape[0] < 10:
+        return html.Div(
+            "Not enough cleaned observations after NA handling for this window.",
+            style={"background": "#ffe8e8", "border": "1px solid #ff6b6b", "padding": "10px", "borderRadius": "10px"},
+        )
+
+    latest = _latest_row(dfw)
+
+    overrides = {
+        "Realized frxt": ov_realized,
+        "% DV01 OATi": ov_dv01,
+        "Livret A net inflows": ov_livret,
+        "PMI": ov_pmi,
+        "Roll Down (bps)": ov_roll,
+    }
+    scenario_x, meta = _build_scenario_inputs(latest, overrides)
+
+    latest_y = float(latest[Y_COL])
+    today = pd.Timestamp.today().normalize()
+
+    # ---- Fit model & compute series
+    if tab == "TAB_SIMPLE":
+        model, yhat = _ols_fit(dfw)
+        model_name = "Simple OLS multi-regression"
+        scenario_pred = _scenario_predict_from_model(model, scenario_x)
+        table_rows = _model_table_from_sm(model)
+        r2 = float(model.rsquared)
+
+    else:
+        poly_kind, model, yhat, feat_names, _Xc = _poly_fit_best(dfw)
+        model_name = f"Polynomial OLS (degree 2) — selected: {poly_kind}"
+        scenario_pred = _scenario_predict_from_model(model, scenario_x, feature_names=feat_names, poly_kind=poly_kind)
+        table_rows = _model_table_from_sm(model)
+        r2 = float(model.rsquared)
+
+    resid = (dfw[Y_COL].astype(float) - yhat.astype(float))
+
+    # ---- Left panel: prediction + latest + inputs used
+    lines = []
+    flags = []
+    for col in X_COLS:
+        src = meta[col]["source"]
+        used = meta[col]["used"]
+        last = meta[col]["latest"]
+        is_flag = meta[col]["flag"]
+        if is_flag:
+            flags.append(
+                html.Div(
+                    f"⚠️ {col}: override differs from latest by > {OVERRIDE_FLAG_DIFF:g} "
+                    f"(latest={_fmt_num(last, 3)}, used={_fmt_num(used, 3)})",
+                    style={
+                        "background": "#ffe8e8",
+                        "border": "1px solid #ff6b6b",
+                        "color": "#b00000",
+                        "padding": "8px 10px",
+                        "borderRadius": "10px",
+                        "fontWeight": 700,
+                        "marginTop": "6px",
+                    },
+                )
+            )
+        lines.append(html.Div(f"{col}: {_fmt_num(used, 4)}  —  {src}", style={"marginBottom": "6px"}))
+
+    left_card = html.Div(
+        [
+            html.Div(model_name, style={"fontWeight": 800, "marginBottom": "8px"}),
+            html.Div(f"Value predicted (Latest Data + overrides): { _fmt_num(scenario_pred, 4) }", style={"fontSize": "18px", "fontWeight": 800}),
+            html.Div(f"True latest {Y_COL}: { _fmt_num(latest_y, 4) }", style={"marginTop": "6px"}),
+            html.Hr(),
+            html.Div("Inputs used:", style={"fontWeight": 800, "marginBottom": "6px"}),
+            *lines,
+            *flags,
+        ],
+        style={
+            "border": "1px solid #e9edf5",
+            "borderRadius": "14px",
+            "padding": "12px",
+            "boxShadow": "0 2px 10px rgba(0,0,0,0.05)",
+            "width": "49%",
+            "minWidth": "420px",
+        },
+    )
+
+    # ---- Right panel: stats table (R² + coef + pval)
+    stats_card = html.Div(
+        [
+            html.Div("Model summary", style={"fontWeight": 800, "marginBottom": "6px"}),
+            html.Div(f"R²: {_fmt_num(r2, 4)}", style={"fontSize": "16px", "fontWeight": 800, "marginBottom": "8px"}),
+            dash_table.DataTable(
+                columns=[
+                    {"name": "Variable", "id": "Variable"},
+                    {"name": "Coefficient", "id": "Coefficient", "type": "numeric", "format": {"specifier": ".6f"}},
+                    {"name": "P-value", "id": "P-value", "type": "numeric", "format": {"specifier": ".6g"}},
+                ],
+                data=table_rows,
+                sort_action="native",
+                page_action="none",
+                style_table={"maxHeight": "260px", "overflowY": "auto"},
+                style_cell={"padding": "6px", "fontSize": "12px"},
+                style_header={"backgroundColor": "#f6f8fc", "fontWeight": "700"},
+                style_as_list_view=True,
+            ),
+        ],
+        style={
+            "border": "1px solid #e9edf5",
+            "borderRadius": "14px",
+            "padding": "12px",
+            "boxShadow": "0 2px 10px rgba(0,0,0,0.05)",
+            "width": "49%",
+            "minWidth": "420px",
+        },
+    )
+
+    top_row = html.Div([left_card, stats_card], style={"display": "flex", "gap": "12px", "flexWrap": "wrap"})
+
+    # ---- Figures
+    fig1 = _fig_pred_vs_actual(
+        dates=dfw.index,
+        actual=dfw[Y_COL].astype(float).values,
+        pred=yhat.astype(float).values,
+        scenario_date=today,
+        scenario_pred=scenario_pred,
+    )
+    fig2 = _fig_residuals(dfw.index, resid.values)
+
+    graphs = html.Div(
+        [
+            dcc.Graph(figure=fig1, config={"displaylogo": False}),
+            dcc.Graph(figure=fig2, config={"displaylogo": False}),
+        ],
+        style={"marginTop": "12px"},
+    )
+
+    return html.Div([top_row, graphs])
+
+
+if __name__ == "__main__":
+    app.run_server(host="0.0.0.0", port=8062, debug=False)
