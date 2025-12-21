@@ -1,0 +1,1130 @@
+# -*- coding: utf-8 -*-
+# ==========================================================
+# French EURO CPI Model — Dash (Linkers-style architecture) — FIXED + SHADED BOLLINGER
+# - ONE unified input section: X1..X5 + y + Month/Year + ADD button
+#   * editing X fields updates scenario prediction + graphs
+#   * clicking ADD/UPDATE pushes same values into dataset and refreshes everything
+# - store-data (dcc.Store) is the single source of truth -> ADD triggers refresh
+# - Timeframe: MAX / 2Y / 1Y / 6M / 3M
+# - Normalise inputs (optional): applies to calibration + overrides (Y stays level)
+# - Seasonal Adjust (optional): adjusts actual & prediction + residual
+# - Bollinger Bands (optional): shaded band between yhat ± k*σ(resid)
+# - Polynomial model improved:
+#   * degree-2 features (linear + squares + interactions)
+#   * backward elimination for p-value > 5% (non-linear terms only)
+#   * hierarchical cleanup: drop squares/interactions whose parent linear p>5%
+# ==========================================================
+
+import socket
+import webbrowser
+from typing import Optional, Dict, Any, List, Tuple
+import calendar
+
+import numpy as np
+import pandas as pd
+
+import dash
+from dash import Dash, dcc, html, Input, Output, State, callback, dash_table, no_update
+import plotly.graph_objects as go
+from dateutil.relativedelta import relativedelta
+
+import statsmodels.api as sm
+
+
+# -------------------------------------------------
+# Assumed globals provided by the environment:
+#   Data: pd.DataFrame
+#   SeasonalityAdj: pd.DataFrame (optional)
+# -------------------------------------------------
+
+# ---- Config colonnes ----
+COL_DATE = "Date"       # utilisée seulement si Data n'a pas DatetimeIndex
+Y_COL = "5y frxt"
+X_COLS = [
+    "Realized frxt",
+    "% DV01 OATi",
+    "Livret A net inflows",
+    "PMI",
+    "Roll Down (bps)",
+]
+
+# Seasonality config
+SEASONALITY_COL = "seasonality_adj"   # nom de la colonne dans SeasonalityAdj
+
+# Seuil de flag pour override
+OVERRIDE_FLAG_DIFF = 20.0
+
+# Fenêtres
+WINDOWS = {
+    "MAX": None,
+    "2Y": relativedelta(years=2),
+    "1Y": relativedelta(years=1),
+    "6M": relativedelta(months=6),
+    "3M": relativedelta(months=3),
+}
+
+# ---- Layout/style ----
+FIG_HEIGHT = 560
+PAGE_WRAPPER_STYLE = {"overflowX": "auto"}
+
+GRAPH_WRAPPER_STYLE = {"width": "90%", "margin": "0 auto"}
+
+CARD_STYLE = {
+    "border": "1px solid #e9edf5",
+    "borderRadius": "10px",
+    "padding": "10px",
+    "background": "white",
+    "boxShadow": "0 2px 8px rgba(0,0,0,0.04)",
+}
+
+RED_FLAG_STYLE = {
+    "background": "#ffe8e8",
+    "border": "1px solid #ff6b6b",
+    "color": "#b00000",
+    "padding": "8px 12px",
+    "borderRadius": "8px",
+    "fontWeight": 700,
+}
+GREEN_FLAG_STYLE = {
+    "background": "#eaffea",
+    "border": "1px solid #6bff8a",
+    "color": "#0a6b1f",
+    "padding": "8px 12px",
+    "borderRadius": "8px",
+    "fontWeight": 700,
+}
+DETAIL_NOTE_STYLE = {"color": "#555", "fontSize": "12px", "marginTop": "4px"}
+
+# ---- Bollinger config ----
+BOLL_N_SIGMA = 2.0
+
+
+# =========================
+# Helpers — data prep
+# =========================
+def _today() -> pd.Timestamp:
+    return pd.Timestamp.today().normalize()
+
+
+def _ensure_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
+    if isinstance(df.index, pd.DatetimeIndex):
+        out = df.copy()
+        out = out[~out.index.isna()]
+        return out.sort_index()
+    if COL_DATE in df.columns:
+        out = df.copy()
+        out[COL_DATE] = pd.to_datetime(out[COL_DATE], errors="coerce")
+        out = out.dropna(subset=[COL_DATE]).set_index(COL_DATE).sort_index()
+        return out
+    raise ValueError("Data must have a DatetimeIndex or a 'Date' column.")
+
+
+def _slice_window(df: pd.DataFrame, window_key: str) -> pd.DataFrame:
+    df = df.sort_index()
+    delta = WINDOWS.get(window_key, None)
+    if delta is None:
+        return df
+    end = df.index.max()
+    start = end - delta
+    return df.loc[df.index >= start]
+
+
+def _clean_xy(df: pd.DataFrame) -> pd.DataFrame:
+    needed = X_COLS + [Y_COL]
+    missing = [c for c in needed if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns in Data: {missing}")
+    out = df[needed].copy()
+    for c in needed:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+    out = out.dropna().sort_index()
+    return out
+
+
+def _last_row(df: pd.DataFrame) -> pd.Series:
+    return df.sort_index().iloc[-1]
+
+
+def _fmt(v: Optional[float], nd: int = 4) -> str:
+    if v is None or not np.isfinite(v):
+        return ""
+    return f"{float(v):.{nd}f}"
+
+
+# =========================
+# Store serialize/deserialize
+# =========================
+def _df_to_store(df: pd.DataFrame) -> str:
+    return df.to_json(date_format="iso", orient="split")
+
+
+def _store_to_df(payload: str) -> pd.DataFrame:
+    df = pd.read_json(payload, orient="split")
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df.index = pd.to_datetime(df.index, errors="coerce")
+    df = df[~df.index.isna()].sort_index()
+    return df
+
+
+# =========================
+# Scenario builder
+# =========================
+def _build_scenario(latest: pd.Series, overrides: Dict[str, Optional[float]]) -> Tuple[Dict[str, float], Dict[str, Any]]:
+    scenario = {}
+    meta = {}
+    for col in X_COLS:
+        last = float(latest[col])
+        ov = overrides.get(col, None)
+        if ov is None:
+            scenario[col] = last
+            meta[col] = {"source": "Latest Available Data", "used": last, "latest": last, "flag": False}
+        else:
+            used = float(ov)
+            meta[col] = {
+                "source": "Overridden",
+                "used": used,
+                "latest": last,
+                "flag": (abs(used - last) > OVERRIDE_FLAG_DIFF),
+            }
+            scenario[col] = used
+    return scenario, meta
+
+
+# =========================
+# Helpers — seasonality
+# =========================
+def _get_seasonality_series(index: pd.DatetimeIndex) -> Optional[pd.Series]:
+    try:
+        adj_df = SeasonalityAdj  # type: ignore[name-defined]
+    except NameError:
+        return None
+    if SEASONALITY_COL not in adj_df.columns:
+        return None
+    s = adj_df[SEASONALITY_COL]
+    s.index = pd.to_datetime(s.index)
+    s = s.sort_index()
+    return s.reindex(index).fillna(0.0)
+
+
+def _apply_seasonal_adjust(
+    y_raw: pd.Series,
+    yhat_raw: pd.Series,
+    scenario_pred_raw: float,
+    seaso_on: bool
+) -> Tuple[pd.Series, pd.Series, float, Optional[str]]:
+    if not seaso_on:
+        return y_raw, yhat_raw, scenario_pred_raw, None
+
+    adj = _get_seasonality_series(y_raw.index)
+    if adj is None:
+        msg = "Seasonal Adjust checked but no seasonality series available — using unadjusted data."
+        return y_raw, yhat_raw, scenario_pred_raw, msg
+
+    y_actual_adj = y_raw + adj
+
+    ratio = np.where(y_raw.values != 0, yhat_raw.values / y_raw.values, 1.0)
+    adj_pred = adj.values * ratio
+    y_pred_adj = yhat_raw + pd.Series(adj_pred, index=y_raw.index)
+
+    last_y = float(y_raw.iloc[-1])
+    last_adj = float(adj.iloc[-1])
+    ratio_scen = (scenario_pred_raw / last_y) if last_y != 0 else 1.0
+    scenario_pred_adj = scenario_pred_raw + last_adj * ratio_scen
+
+    return y_actual_adj, y_pred_adj, scenario_pred_adj, None
+
+
+# =========================
+# Helpers — models (Simple)
+# =========================
+def _ols_fit_from_Xy(X: pd.DataFrame, y: pd.Series):
+    Xc = sm.add_constant(X)
+    model = sm.OLS(y, Xc).fit()
+    yhat = model.predict(Xc)
+    return model, yhat
+
+
+def _predict_simple_from_X(
+    model,
+    scenario_X: Dict[str, float],
+    X_mean=None,
+    X_std=None,
+    normalize=False
+) -> float:
+    row = pd.DataFrame([scenario_X], columns=X_COLS).astype(float)
+    if normalize and X_mean is not None and X_std is not None:
+        row = (row - X_mean) / X_std
+    Xc = sm.add_constant(row)
+    return float(model.predict(Xc).iloc[0])
+
+
+# =========================
+# Helpers — Polynomial improved (deg2 + pruning)
+# =========================
+def _poly_make_features(X_base: pd.DataFrame, with_squares: bool, with_interactions: bool) -> pd.DataFrame:
+    feats = X_base.copy()
+
+    if with_squares:
+        for c in X_COLS:
+            feats[f"{c}^2"] = X_base[c] ** 2
+
+    if with_interactions:
+        cols = list(X_COLS)
+        for i in range(len(cols)):
+            for j in range(i + 1, len(cols)):
+                ci, cj = cols[i], cols[j]
+                feats[f"{ci}*{cj}"] = X_base[ci] * X_base[cj]
+
+    return feats
+
+
+def _poly_backward_elimination(y: pd.Series, feats: pd.DataFrame, alpha: float = 0.05) -> Tuple[Any, List[str]]:
+    cols = list(feats.columns)
+    removable = [c for c in cols if c not in X_COLS]  # keep linear terms always
+
+    if not removable:
+        m = sm.OLS(y, sm.add_constant(feats[cols])).fit()
+        return m, cols
+
+    while True:
+        m = sm.OLS(y, sm.add_constant(feats[cols])).fit()
+        p = m.pvalues.drop(labels=["const"], errors="ignore")
+
+        cand = [c for c in removable if c in p.index]
+        if not cand:
+            return m, cols
+
+        worst = max(cand, key=lambda c: float(p.loc[c]))
+        worst_p = float(p.loc[worst])
+
+        if worst_p <= alpha:
+            return m, cols
+
+        cols.remove(worst)
+        removable.remove(worst)
+
+        if not removable:
+            m2 = sm.OLS(y, sm.add_constant(feats[cols])).fit()
+            return m2, cols
+
+
+def _poly_hierarchical_cleanup(model, cols: List[str], alpha: float = 0.05) -> List[str]:
+    p = model.pvalues
+
+    def lin_sig(xname: str) -> bool:
+        if xname not in p.index:
+            return True
+        try:
+            return float(p.loc[xname]) <= alpha
+        except Exception:
+            return True
+
+    keep = cols[:]
+    drop = []
+
+    for c in cols:
+        if c.endswith("^2"):
+            parent = c[:-2]
+            if parent in X_COLS and not lin_sig(parent):
+                drop.append(c)
+        elif "*" in c:
+            a, b = c.split("*", 1)
+            if (a in X_COLS and not lin_sig(a)) or (b in X_COLS and not lin_sig(b)):
+                drop.append(c)
+
+    for d in drop:
+        if d in keep:
+            keep.remove(d)
+
+    return keep
+
+
+def _poly_fit_best_from_Xy_improved(X_base: pd.DataFrame, y: pd.Series, alpha: float = 0.05):
+    candidates = []
+
+    # A: linear only
+    feats_A = _poly_make_features(X_base, with_squares=False, with_interactions=False)
+    mA = sm.OLS(y, sm.add_constant(feats_A)).fit()
+    yhatA = mA.predict(sm.add_constant(feats_A))
+    candidates.append(("Degree-2 (linear)", mA, yhatA, list(feats_A.columns), float(mA.rsquared)))
+
+    # B: + squares (pruned)
+    feats_B = _poly_make_features(X_base, with_squares=True, with_interactions=False)
+    mB0, colsB = _poly_backward_elimination(y, feats_B, alpha=alpha)
+    colsB = _poly_hierarchical_cleanup(mB0, colsB, alpha=alpha)
+    mB = sm.OLS(y, sm.add_constant(feats_B[colsB])).fit()
+    yhatB = mB.predict(sm.add_constant(feats_B[colsB]))
+    candidates.append(("Degree-2 (+squares, pruned)", mB, yhatB, colsB, float(mB.rsquared)))
+
+    # C: + squares + interactions (pruned)
+    feats_C = _poly_make_features(X_base, with_squares=True, with_interactions=True)
+    mC0, colsC = _poly_backward_elimination(y, feats_C, alpha=alpha)
+    colsC = _poly_hierarchical_cleanup(mC0, colsC, alpha=alpha)
+    mC = sm.OLS(y, sm.add_constant(feats_C[colsC])).fit()
+    yhatC = mC.predict(sm.add_constant(feats_C[colsC]))
+    candidates.append(("Degree-2 (+squares+interactions, pruned)", mC, yhatC, colsC, float(mC.rsquared)))
+
+    best = max(candidates, key=lambda t: t[4])
+    label, model, yhat, feat_cols, _r2 = best
+    return label, model, yhat, feat_cols
+
+
+def _predict_poly_from_X_base_improved(
+    model,
+    scenario_base: Dict[str, float],
+    poly_kind: str,
+    feat_cols: List[str]
+) -> float:
+    base = pd.DataFrame([scenario_base], columns=X_COLS).astype(float)
+
+    if poly_kind == "Degree-2 (linear)":
+        feats = _poly_make_features(base, with_squares=False, with_interactions=False)
+    elif "+squares+interactions" in poly_kind:
+        feats = _poly_make_features(base, with_squares=True, with_interactions=True)
+    else:
+        feats = _poly_make_features(base, with_squares=True, with_interactions=False)
+
+    feats = feats.reindex(columns=feat_cols, fill_value=0.0)
+    Xc = sm.add_constant(feats)
+    return float(model.predict(Xc).iloc[0])
+
+
+def _model_table(model) -> List[Dict[str, Any]]:
+    rows = []
+    for name in model.params.index:
+        rows.append({
+            "Variable": name,
+            "Coefficient": float(model.params.loc[name]),
+            "P-value": float(model.pvalues.loc[name]) if name in model.pvalues.index else np.nan,
+        })
+    return rows
+
+
+# =========================
+# Helpers — figures (with shaded Bollinger)
+# =========================
+def _fig_pred_vs_actual(
+    idx, y, yhat, scenario_date, scenario_pred,
+    show_bbands: bool = False, resid_sigma: Optional[float] = None
+) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=idx, y=y, mode="lines", name="Actual"))
+    fig.add_trace(go.Scatter(x=idx, y=yhat, mode="lines", name="Model prediction"))
+
+    if show_bbands and resid_sigma is not None and np.isfinite(resid_sigma) and resid_sigma > 0:
+        upper = yhat + BOLL_N_SIGMA * resid_sigma
+        lower = yhat - BOLL_N_SIGMA * resid_sigma
+
+        # Upper "support" trace (hidden line) so we can fill to next trace
+        fig.add_trace(go.Scatter(
+            x=idx, y=upper,
+            mode="lines",
+            name=f"Band +{BOLL_N_SIGMA:.0f}σ",
+            line=dict(width=0),
+            hoverinfo="skip",
+            showlegend=False
+        ))
+
+        # Lower trace filled to upper => shaded band
+        fig.add_trace(go.Scatter(
+            x=idx, y=lower,
+            mode="lines",
+            name=f"Bollinger band (±{BOLL_N_SIGMA:.0f}σ resid)",
+            line=dict(width=0),
+            fill="tonexty",
+            fillcolor="rgba(100, 149, 237, 0.18)",
+            hoverinfo="skip",
+            showlegend=True
+        ))
+
+        # Optional outlines (comment out if you want band only)
+        fig.add_trace(go.Scatter(
+            x=idx, y=upper,
+            mode="lines",
+            name="Upper",
+            line=dict(width=1, dash="dot"),
+            hoverinfo="skip",
+            showlegend=False
+        ))
+        fig.add_trace(go.Scatter(
+            x=idx, y=lower,
+            mode="lines",
+            name="Lower",
+            line=dict(width=1, dash="dot"),
+            hoverinfo="skip",
+            showlegend=False
+        ))
+
+    fig.add_trace(go.Scatter(
+        x=[scenario_date], y=[scenario_pred],
+        mode="markers", name="Scenario (today)",
+        marker=dict(size=12, color="crimson", line=dict(width=1, color="black"))
+    ))
+
+    fig.update_layout(
+        title="Model prediction vs Actual",
+        template="plotly_white",
+        height=FIG_HEIGHT,
+        xaxis_title="Date",
+        yaxis_title=Y_COL,
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    return fig
+
+
+def _fig_residuals(idx, resid) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=idx, y=resid, mode="lines", name="Residual"))
+    fig.update_layout(
+        title="Residuals (Actual − Predicted)",
+        template="plotly_white",
+        height=FIG_HEIGHT,
+        xaxis_title="Date",
+        yaxis_title="Residual",
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    return fig
+
+
+# =========================
+# App
+# =========================
+app: Dash = dash.Dash(__name__, suppress_callback_exceptions=True)
+app.title = "French EURO CPI Model"
+
+
+def num_input(id_: str, label: str, placeholder: str = ""):
+    return html.Div([
+        html.Label(label),
+        dcc.Input(
+            id=id_,
+            type="number",
+            placeholder=placeholder,
+            debounce=True,
+            style={"width": "190px", "padding": "6px",
+                   "borderRadius": "8px", "border": "1px solid #dfe6f3"}
+        )
+    ], style={"display": "inline-block", "marginRight": "14px", "marginBottom": "8px"})
+
+
+# ---- INIT store-data from global Data ----
+try:
+    _INIT_DF = _ensure_datetime_index(Data)
+except Exception:
+    _INIT_DF = pd.DataFrame(columns=X_COLS + [Y_COL])
+_INIT_STORE = _df_to_store(_INIT_DF)
+
+# Years dropdown helper
+THIS_YEAR = int(pd.Timestamp.today().year)
+YEAR_OPTIONS = [{"label": str(y), "value": y} for y in range(1995, THIS_YEAR + 2)]
+
+# ---- Layout principal ----
+app.layout = html.Div([
+    dcc.Store(id="store-data", data=_INIT_STORE),
+
+    html.Div([
+
+        html.H2("📈 French EURO CPI Model", style={"marginBottom": "6px"}),
+
+        # =========================
+        # ONE unified input section
+        # =========================
+        html.Div([
+            html.Div("Scenario / Add inputs (same fields):", style={"fontWeight": 800, "marginBottom": "6px"}),
+
+            html.Div([
+                num_input("x1", "Realized frxt", "(optional override / required for ADD)"),
+                num_input("x2", "% DV01 OATi issued", "(optional override / required for ADD)"),
+                num_input("x3", "Livret A net inflows", "(optional override / required for ADD)"),
+                num_input("x4", "PMI", "(optional override / required for ADD)"),
+                num_input("x5", "Roll Down (bps)", "(optional override / required for ADD)"),
+                num_input("y_new", f"{Y_COL} (for ADD)", "(required for ADD)"),
+            ]),
+
+            html.Div([
+                html.Label("Month", style={"marginRight": "6px"}),
+                dcc.Dropdown(
+                    id="add-month",
+                    options=[{"label": calendar.month_name[m], "value": m} for m in range(1, 13)],
+                    value=int(_today().month),
+                    clearable=False,
+                    style={"width": "180px", "display": "inline-block", "marginRight": "10px"}
+                ),
+                html.Label("Year", style={"marginRight": "6px"}),
+                dcc.Dropdown(
+                    id="add-year",
+                    options=YEAR_OPTIONS,
+                    value=int(_today().year),
+                    clearable=False,
+                    style={"width": "140px", "display": "inline-block", "marginRight": "12px"}
+                ),
+
+                html.Button("ADD / UPDATE", id="add-button", n_clicks=0,
+                            style={"padding": "8px 16px", "borderRadius": "10px",
+                                   "border": "1px solid #4c6fff", "background": "#4c6fff",
+                                   "color": "white", "cursor": "pointer",
+                                   "fontWeight": 800}),
+            ], style={"marginTop": "6px"}),
+
+            html.Div(id="add-note", style={"marginTop": "8px"}),
+
+        ], style={**CARD_STYLE, "marginBottom": "12px"}),
+
+        # Window + toggles
+        html.Div([
+            html.Div([
+                html.Label("Regression window", style={"fontWeight": 700}),
+                dcc.RadioItems(
+                    id="window",
+                    options=[{"label": k, "value": k} for k in WINDOWS.keys()],
+                    value="MAX",
+                    inline=True
+                ),
+            ], style={"display": "inline-block", "marginRight": "40px"}),
+
+            html.Div([
+                dcc.Checklist(
+                    id="normalize-switch",
+                    options=[{"label": "Normalise inputs", "value": "norm"}],
+                    value=[],
+                    inline=True
+                ),
+            ], style={"display": "inline-block", "marginRight": "30px"}),
+
+            html.Div([
+                dcc.Checklist(
+                    id="seaso-switch",
+                    options=[{"label": "Seasonal Adjust", "value": "seaso"}],
+                    value=[],
+                    inline=True
+                ),
+            ], style={"display": "inline-block", "marginRight": "30px"}),
+
+            html.Div([
+                dcc.Checklist(
+                    id="boll-switch",
+                    options=[{"label": "Bollinger Bands", "value": "boll"}],
+                    value=[],
+                    inline=True
+                ),
+            ], style={"display": "inline-block"}),
+        ], style={"marginBottom": "8px"}),
+
+        dcc.Tabs(id="active-tab", value="TAB_SIMPLE", children=[
+            dcc.Tab(label="Simple Multi-Regression", value="TAB_SIMPLE"),
+            dcc.Tab(label="Polynomial Regression (deg 2)", value="TAB_POLY"),
+        ]),
+
+        html.Div(id="model-equation",
+                 style={"marginTop": "6px", "marginBottom": "10px",
+                        "fontFamily": "monospace", "fontSize": "13px"}),
+
+        html.Div(id="tab-content", style={"marginTop": "10px"}),
+
+    ], style={"width": "90%", "margin": "0 auto"}),
+
+], style=PAGE_WRAPPER_STYLE)
+
+
+# =========================
+# Model equation text
+# =========================
+@callback(
+    Output("model-equation", "children"),
+    Input("active-tab", "value"),
+    Input("normalize-switch", "value")
+)
+def _update_equation(tab, norm_val):
+    norm_on = "norm" in (norm_val or [])
+    norm_txt = " (with X standardised: (X - mean)/std)" if norm_on else ""
+    if tab == "TAB_SIMPLE":
+        eq = (
+            f"Linear model{norm_txt}:\n"
+            "  y_t = β0 + β1 * X1_t + β2 * X2_t + β3 * X3_t + β4 * X4_t + β5 * X5_t\n"
+            f"  with X1={X_COLS[0]}, X2={X_COLS[1]}, X3={X_COLS[2]}, X4={X_COLS[3]}, X5={X_COLS[4]}."
+        )
+    else:
+        eq = (
+            f"Polynomial model (degree 2, pruned){norm_txt}:\n"
+            "  y_t = β0"
+            " + Σ β_i * X_i_t"
+            " + Σ γ_i * (X_i_t)^2"
+            " + Σ δ_ij * (X_i_t * X_j_t), i≠j\n"
+            "  with non-linear terms removed if p-value > 5% (and hierarchical cleanup)."
+        )
+    return html.Pre(eq, style={"margin": 0})
+
+
+# =========================
+# Render each tab’s static content
+# =========================
+@callback(Output("tab-content", "children"), Input("active-tab", "value"))
+def _render_tab(tab):
+    if tab == "TAB_SIMPLE":
+        left_col = html.Div([
+            html.Div(id="simple-note", style={"margin": "6px 0"}),
+
+            html.Div([
+                html.Div(id="simple-summary-left", style={**CARD_STYLE, "width": "49%"}),
+                html.Div(id="simple-summary-right", style={**CARD_STYLE, "width": "49%"}),
+            ], style={"display": "flex", "gap": "12px", "marginBottom": "10px"}),
+
+            html.Div(dcc.Graph(id="simple-fig", config={"displaylogo": False}), style=GRAPH_WRAPPER_STYLE),
+            html.Div(dcc.Graph(id="simple-resid-fig", config={"displaylogo": False}),
+                     style={**GRAPH_WRAPPER_STYLE, "marginTop": "8px"}),
+
+            html.Div(id="simple-table", style={"marginTop": "8px"}),
+        ])
+        return html.Div([left_col], style={"display": "block", "minWidth": "1000px"})
+
+    if tab == "TAB_POLY":
+        left_col = html.Div([
+            html.Div(id="poly-note", style={"margin": "6px 0"}),
+
+            html.Div([
+                html.Div(id="poly-summary-left", style={**CARD_STYLE, "width": "49%"}),
+                html.Div(id="poly-summary-right", style={**CARD_STYLE, "width": "49%"}),
+            ], style={"display": "flex", "gap": "12px", "marginBottom": "10px"}),
+
+            html.Div(dcc.Graph(id="poly-fig", config={"displaylogo": False}), style=GRAPH_WRAPPER_STYLE),
+            html.Div(dcc.Graph(id="poly-resid-fig", config={"displaylogo": False}),
+                     style={**GRAPH_WRAPPER_STYLE, "marginTop": "8px"}),
+
+            html.Div(id="poly-table", style={"marginTop": "8px"}),
+        ])
+        return html.Div([left_col], style={"display": "block", "minWidth": "1000px"})
+
+    return html.Div()
+
+
+# =========================
+# ADD / UPDATE monthly data -> updates store-data (refresh everywhere)
+# - same inputs x1..x5 + y_new
+# - behavior: create/update business days of selected month
+# =========================
+@callback(
+    Output("store-data", "data"),
+    Output("add-note", "children"),
+    Input("add-button", "n_clicks"),
+    State("store-data", "data"),
+    State("add-month", "value"),
+    State("add-year", "value"),
+    State("x1", "value"),
+    State("x2", "value"),
+    State("x3", "value"),
+    State("x4", "value"),
+    State("x5", "value"),
+    State("y_new", "value"),
+    prevent_initial_call=True
+)
+def _add_month_data(n_clicks, store_payload, month, year, x1, x2, x3, x4, x5, y_new):
+    if not n_clicks:
+        return no_update, ""
+
+    if month is None or year is None:
+        return no_update, html.Div("⚠️ Please select Month and Year before clicking ADD/UPDATE.", style=RED_FLAG_STYLE)
+
+    required = [x1, x2, x3, x4, x5, y_new]
+    if any(v is None for v in required):
+        return no_update, html.Div("⚠️ For ADD/UPDATE: please fill ALL 5 X inputs + y.", style=RED_FLAG_STYLE)
+
+    try:
+        df = _store_to_df(store_payload)
+        df = _ensure_datetime_index(df)
+    except Exception as e:
+        return no_update, html.Div(f"⚠️ Store/Data error: {e}", style=RED_FLAG_STYLE)
+
+    start = pd.Timestamp(year=int(year), month=int(month), day=1)
+    if month == 12:
+        end = pd.Timestamp(year=int(year) + 1, month=1, day=1) - pd.Timedelta(days=1)
+    else:
+        end = pd.Timestamp(year=int(year), month=int(month) + 1, day=1) - pd.Timedelta(days=1)
+
+    all_days = pd.date_range(start, end, freq="D")
+    biz_days = all_days[all_days.dayofweek < 5]
+    if len(biz_days) == 0:
+        return no_update, html.Div("⚠️ No business days in this month.", style=RED_FLAG_STYLE)
+
+    new_vals = {
+        X_COLS[0]: float(x1),
+        X_COLS[1]: float(x2),
+        X_COLS[2]: float(x3),
+        X_COLS[3]: float(x4),
+        X_COLS[4]: float(x5),
+        Y_COL: float(y_new),
+    }
+
+    for c in X_COLS + [Y_COL]:
+        if c not in df.columns:
+            df[c] = np.nan
+
+    n_new = 0
+    n_upd = 0
+
+    for d in biz_days:
+        if d in df.index:
+            for col, val in new_vals.items():
+                df.loc[d, col] = val
+            n_upd += 1
+        else:
+            row = {col: np.nan for col in df.columns}
+            for col, val in new_vals.items():
+                row[col] = val
+            df.loc[d] = row
+            n_new += 1
+
+    df = df.sort_index()
+    payload = _df_to_store(df)
+
+    msg = html.Div(
+        f"✅ Added {n_new} new rows and updated {n_upd} rows for {calendar.month_name[int(month)]} {int(year)}. "
+        f"Latest date now: {df.index.max().date()}",
+        style=GREEN_FLAG_STYLE
+    )
+    return payload, msg
+
+
+# =========================
+# Callback — Simple tab
+# =========================
+@callback(
+    Output("simple-fig", "figure"),
+    Output("simple-resid-fig", "figure"),
+    Output("simple-summary-left", "children"),
+    Output("simple-summary-right", "children"),
+    Output("simple-note", "children"),
+    Output("simple-table", "children"),
+    Input("active-tab", "value"),
+    Input("store-data", "data"),
+    Input("window", "value"),
+    Input("x1", "value"),
+    Input("x2", "value"),
+    Input("x3", "value"),
+    Input("x4", "value"),
+    Input("x5", "value"),
+    Input("normalize-switch", "value"),
+    Input("seaso-switch", "value"),
+    Input("boll-switch", "value"),
+    prevent_initial_call=False
+)
+def _upd_simple(tab, store_payload, window_key, ov1, ov2, ov3, ov4, ov5, norm_val, seaso_val, boll_val):
+    empty_fig = go.Figure().update_layout(template="plotly_white", height=FIG_HEIGHT)
+    if tab != "TAB_SIMPLE":
+        return empty_fig, empty_fig, "", "", "", ""
+
+    norm_on = "norm" in (norm_val or [])
+    seaso_on = "seaso" in (seaso_val or [])
+    boll_on = "boll" in (boll_val or [])
+
+    try:
+        df = _store_to_df(store_payload)
+        df = _ensure_datetime_index(df)
+        dfw_raw = _clean_xy(_slice_window(df, window_key))
+    except Exception as e:
+        msg = html.Div(f"Data error: {e}", style=RED_FLAG_STYLE)
+        return empty_fig, empty_fig, "", "", msg, ""
+
+    if dfw_raw.shape[0] < 10:
+        msg = html.Div("⚠️ Not enough data after NA handling for this window.", style=RED_FLAG_STYLE)
+        return empty_fig, empty_fig, "", "", msg, ""
+
+    latest = _last_row(dfw_raw)
+    overrides = {X_COLS[0]: ov1, X_COLS[1]: ov2, X_COLS[2]: ov3, X_COLS[3]: ov4, X_COLS[4]: ov5}
+    scenario_x_raw, meta = _build_scenario(latest, overrides)
+
+    X_raw = dfw_raw[X_COLS].astype(float)
+    y_raw = dfw_raw[Y_COL].astype(float)
+
+    if norm_on:
+        X_mean = X_raw.mean()
+        X_std = X_raw.std(ddof=0).replace(0, np.nan).fillna(1.0)
+        X_for_fit = (X_raw - X_mean) / X_std
+    else:
+        X_mean = None
+        X_std = None
+        X_for_fit = X_raw
+
+    model, yhat_raw = _ols_fit_from_Xy(X_for_fit, y_raw)
+    r2 = float(model.rsquared)
+
+    latest_inputs = {c: float(latest[c]) for c in X_COLS}
+    pred_latest_raw = _predict_simple_from_X(model, latest_inputs, X_mean=X_mean, X_std=X_std, normalize=norm_on)
+    scenario_pred_raw = _predict_simple_from_X(model, scenario_x_raw, X_mean=X_mean, X_std=X_std, normalize=norm_on)
+
+    y_disp, yhat_disp, scenario_pred_disp, seaso_msg = _apply_seasonal_adjust(
+        y_raw, yhat_raw, scenario_pred_raw, seaso_on=seaso_on
+    )
+    _, _, pred_latest_disp, _ = _apply_seasonal_adjust(y_raw, yhat_raw, pred_latest_raw, seaso_on=seaso_on)
+
+    resid_disp = y_disp - yhat_disp
+    resid_sigma = float(resid_disp.std(ddof=1)) if resid_disp.size > 1 else None
+    latest_y_disp = float(y_disp.iloc[-1])
+
+    left_lines = [
+        html.Div("Simple OLS multi-regression", style={"fontWeight": 800, "marginBottom": "6px"}),
+        html.Div(f"Predicted (Latest Data): {_fmt(pred_latest_disp, 4)}",
+                 style={"fontSize": "15px", "fontWeight": 700}),
+        html.Div(f"Predicted (Scenario: latest + overrides): {_fmt(scenario_pred_disp, 4)}",
+                 style={"fontSize": "19px", "fontWeight": 900, "marginTop": "4px"}),
+        html.Div(f"True latest {Y_COL}: {_fmt(latest_y_disp, 4)}", style={"marginTop": "6px"}),
+        html.Hr(),
+        html.Div("Inputs used:", style={"fontWeight": 800, "marginBottom": "6px"}),
+    ]
+    for col in X_COLS:
+        used = meta[col]["used"]
+        src = meta[col]["source"]
+        left_lines.append(html.Div(f"{col}: {_fmt(used, 4)} — {src}", style={"marginBottom": "6px"}))
+        if meta[col]["flag"]:
+            last = meta[col]["latest"]
+            left_lines.append(html.Div(
+                f"⚠️ override differs from latest by > {OVERRIDE_FLAG_DIFF:g} "
+                f"(latest={_fmt(last,3)}, used={_fmt(used,3)})",
+                style={**RED_FLAG_STYLE, "marginTop": "6px"}
+            ))
+
+    right_block = [
+        html.Div("Model summary", style={"fontWeight": 800, "marginBottom": "6px"}),
+        html.Div(f"R²: {_fmt(r2, 4)}", style={"fontSize": "16px", "fontWeight": 800, "marginBottom": "8px"}),
+        dash_table.DataTable(
+            columns=[
+                {"name": "Variable", "id": "Variable"},
+                {"name": "Coefficient", "id": "Coefficient", "type": "numeric", "format": {"specifier": ".6f"}},
+                {"name": "P-value", "id": "P-value", "type": "numeric", "format": {"specifier": ".6g"}},
+            ],
+            data=_model_table(model),
+            sort_action="native",
+            page_action="none",
+            style_table={"maxHeight": "260px", "overflowY": "auto"},
+            style_cell={"padding": "6px", "fontSize": "12px"},
+            style_header={"backgroundColor": "#f6f8fc", "fontWeight": "700"},
+            style_as_list_view=True,
+        )
+    ]
+
+    fig1 = _fig_pred_vs_actual(
+        dfw_raw.index,
+        y_disp.values,
+        yhat_disp.values,
+        _today(),
+        scenario_pred_disp,
+        show_bbands=boll_on,
+        resid_sigma=resid_sigma
+    )
+    fig2 = _fig_residuals(dfw_raw.index, resid_disp.values)
+
+    norm_txt = " | Normalised X" if norm_on else ""
+    seaso_txt = ""
+    if seaso_on and seaso_msg is None:
+        seaso_txt = " | Seasonal-adjusted"
+    elif seaso_msg is not None:
+        seaso_txt = " | Seasonal Adjust requested but unavailable"
+    boll_txt = " | Bollinger bands on" if boll_on else ""
+    note_parts = [f"Window: {window_key} | Obs: {dfw_raw.shape[0]}{norm_txt}{seaso_txt}{boll_txt}"]
+    if seaso_msg:
+        note_parts.append(seaso_msg)
+    note = html.Div("  ".join(note_parts), style=DETAIL_NOTE_STYLE)
+
+    df_view = dfw_raw.copy().reset_index()
+    df_view.rename(columns={df_view.columns[0]: "Date"}, inplace=True)
+
+    table = dash_table.DataTable(
+        columns=[{"name": c, "id": c} for c in df_view.columns],
+        data=df_view.to_dict("records"),
+        page_size=25,
+        sort_action="native",
+        style_table={"overflowX": "auto"},
+        style_cell={"padding": "4px", "fontSize": "11px"},
+        style_header={"backgroundColor": "#f6f8fc", "fontWeight": "700"},
+    )
+
+    return fig1, fig2, html.Div(left_lines), html.Div(right_block), note, table
+
+
+# =========================
+# Callback — Poly tab (IMPROVED)
+# =========================
+@callback(
+    Output("poly-fig", "figure"),
+    Output("poly-resid-fig", "figure"),
+    Output("poly-summary-left", "children"),
+    Output("poly-summary-right", "children"),
+    Output("poly-note", "children"),
+    Output("poly-table", "children"),
+    Input("active-tab", "value"),
+    Input("store-data", "data"),
+    Input("window", "value"),
+    Input("x1", "value"),
+    Input("x2", "value"),
+    Input("x3", "value"),
+    Input("x4", "value"),
+    Input("x5", "value"),
+    Input("normalize-switch", "value"),
+    Input("seaso-switch", "value"),
+    Input("boll-switch", "value"),
+    prevent_initial_call=False
+)
+def _upd_poly(tab, store_payload, window_key, ov1, ov2, ov3, ov4, ov5, norm_val, seaso_val, boll_val):
+    empty_fig = go.Figure().update_layout(template="plotly_white", height=FIG_HEIGHT)
+    if tab != "TAB_POLY":
+        return empty_fig, empty_fig, "", "", "", ""
+
+    norm_on = "norm" in (norm_val or [])
+    seaso_on = "seaso" in (seaso_val or [])
+    boll_on = "boll" in (boll_val or [])
+
+    try:
+        df = _store_to_df(store_payload)
+        df = _ensure_datetime_index(df)
+        dfw_raw = _clean_xy(_slice_window(df, window_key))
+    except Exception as e:
+        msg = html.Div(f"Data error: {e}", style=RED_FLAG_STYLE)
+        return empty_fig, empty_fig, "", "", msg, ""
+
+    if dfw_raw.shape[0] < 25:
+        msg = html.Div("⚠️ Not enough data for polynomial fit after NA handling (need ~25+).", style=RED_FLAG_STYLE)
+        return empty_fig, empty_fig, "", "", msg, ""
+
+    latest = _last_row(dfw_raw)
+    overrides = {X_COLS[0]: ov1, X_COLS[1]: ov2, X_COLS[2]: ov3, X_COLS[3]: ov4, X_COLS[4]: ov5}
+    scenario_x_raw, meta = _build_scenario(latest, overrides)
+
+    X_raw = dfw_raw[X_COLS].astype(float)
+    y_raw = dfw_raw[Y_COL].astype(float)
+
+    if norm_on:
+        X_mean = X_raw.mean()
+        X_std = X_raw.std(ddof=0).replace(0, np.nan).fillna(1.0)
+        X_base = (X_raw - X_mean) / X_std
+        scenario_base = {col: (scenario_x_raw[col] - float(X_mean[col])) / float(X_std[col]) for col in X_COLS}
+        latest_base = {col: (float(latest[col]) - float(X_mean[col])) / float(X_std[col]) for col in X_COLS}
+    else:
+        X_base = X_raw
+        scenario_base = scenario_x_raw
+        latest_base = {col: float(latest[col]) for col in X_COLS}
+
+    poly_kind, model, yhat_raw, feat_cols = _poly_fit_best_from_Xy_improved(X_base, y_raw, alpha=0.05)
+    r2 = float(model.rsquared)
+
+    pred_latest_raw = _predict_poly_from_X_base_improved(model, latest_base, poly_kind, feat_cols)
+    scenario_pred_raw = _predict_poly_from_X_base_improved(model, scenario_base, poly_kind, feat_cols)
+
+    y_disp, yhat_disp, scenario_pred_disp, seaso_msg = _apply_seasonal_adjust(
+        y_raw, yhat_raw, scenario_pred_raw, seaso_on=seaso_on
+    )
+    _, _, pred_latest_disp, _ = _apply_seasonal_adjust(y_raw, yhat_raw, pred_latest_raw, seaso_on=seaso_on)
+
+    resid_disp = y_disp - yhat_disp
+    resid_sigma = float(resid_disp.std(ddof=1)) if resid_disp.size > 1 else None
+    latest_y_disp = float(y_disp.iloc[-1])
+
+    left_lines = [
+        html.Div(f"Polynomial OLS (deg 2) — selected: {poly_kind}",
+                 style={"fontWeight": 800, "marginBottom": "6px"}),
+        html.Div(f"Predicted (Latest Data): {_fmt(pred_latest_disp, 4)}",
+                 style={"fontSize": "15px", "fontWeight": 700}),
+        html.Div(f"Predicted (Scenario: latest + overrides): {_fmt(scenario_pred_disp, 4)}",
+                 style={"fontSize": "19px", "fontWeight": 900, "marginTop": "4px"}),
+        html.Div(f"True latest {Y_COL}: {_fmt(latest_y_disp, 4)}", style={"marginTop": "6px"}),
+        html.Hr(),
+        html.Div("Inputs used:", style={"fontWeight": 800, "marginBottom": "6px"}),
+    ]
+    for col in X_COLS:
+        used = meta[col]["used"]
+        src = meta[col]["source"]
+        left_lines.append(html.Div(f"{col}: {_fmt(used, 4)} — {src}", style={"marginBottom": "6px"}))
+        if meta[col]["flag"]:
+            last = meta[col]["latest"]
+            left_lines.append(html.Div(
+                f"⚠️ override differs from latest by > {OVERRIDE_FLAG_DIFF:g} "
+                f"(latest={_fmt(last,3)}, used={_fmt(used,3)})",
+                style={**RED_FLAG_STYLE, "marginTop": "6px"}
+            ))
+
+    right_block = [
+        html.Div("Model summary", style={"fontWeight": 800, "marginBottom": "6px"}),
+        html.Div(f"R²: {_fmt(r2, 4)}", style={"fontSize": "16px", "fontWeight": 800, "marginBottom": "8px"}),
+        dash_table.DataTable(
+            columns=[
+                {"name": "Variable", "id": "Variable"},
+                {"name": "Coefficient", "id": "Coefficient", "type": "numeric", "format": {"specifier": ".6f"}},
+                {"name": "P-value", "id": "P-value", "type": "numeric", "format": {"specifier": ".6g"}},
+            ],
+            data=_model_table(model),
+            sort_action="native",
+            page_action="none",
+            style_table={"maxHeight": "260px", "overflowY": "auto"},
+            style_cell={"padding": "6px", "fontSize": "12px"},
+            style_header={"backgroundColor": "#f6f8fc", "fontWeight": "700"},
+            style_as_list_view=True,
+        ),
+        html.Div(f"Active terms: {len(model.params)} (incl. const)", style=DETAIL_NOTE_STYLE),
+    ]
+
+    fig1 = _fig_pred_vs_actual(
+        dfw_raw.index,
+        y_disp.values,
+        yhat_disp.values,
+        _today(),
+        scenario_pred_disp,
+        show_bbands=boll_on,
+        resid_sigma=resid_sigma
+    )
+    fig2 = _fig_residuals(dfw_raw.index, resid_disp.values)
+
+    norm_txt = " | Normalised X" if norm_on else ""
+    seaso_txt = ""
+    if seaso_on and seaso_msg is None:
+        seaso_txt = " | Seasonal-adjusted"
+    elif seaso_msg is not None:
+        seaso_txt = " | Seasonal Adjust requested but unavailable"
+    boll_txt = " | Bollinger bands on" if boll_on else ""
+    note_parts = [f"Window: {window_key} | Obs: {dfw_raw.shape[0]} | {poly_kind}{norm_txt}{seaso_txt}{boll_txt}"]
+    if seaso_msg:
+        note_parts.append(seaso_msg)
+    note = html.Div("  ".join(note_parts), style=DETAIL_NOTE_STYLE)
+
+    df_view = dfw_raw.copy().reset_index()
+    df_view.rename(columns={df_view.columns[0]: "Date"}, inplace=True)
+
+    table = dash_table.DataTable(
+        columns=[{"name": c, "id": c} for c in df_view.columns],
+        data=df_view.to_dict("records"),
+        page_size=25,
+        sort_action="native",
+        style_table={"overflowX": "auto"},
+        style_cell={"padding": "4px", "fontSize": "11px"},
+        style_header={"backgroundColor": "#f6f8fc", "fontWeight": "700"},
+    )
+
+    return fig1, fig2, html.Div(left_lines), html.Div(right_block), note, table
+
+
+# =========================
+# Main — launch
+# =========================
+def _get_local_ip() -> str:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = "127.0.0.1"
+    finally:
+        s.close()
+    return ip
+
+
+if __name__ == "__main__":
+    host, port = "0.0.0.0", 8063
+    local_ip = _get_local_ip()
+    print("\n================= SHARE THIS =================")
+    print(f"Local (you) : http://localhost:{port}")
+    print(f"LAN (team)  : http://{local_ip}:{port}")
+    print("==============================================\n")
+    try:
+        webbrowser.open(f"http://localhost:{port}")
+    except Exception:
+        pass
+    app.run_server(host=host, port=port, debug=False)
