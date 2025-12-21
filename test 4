@@ -1,15 +1,11 @@
 # -*- coding: utf-8 -*-
 # ==========================================================
-# French EURO CPI Model — Dash (Linkers-style architecture) — UPDATED
-# - ONE unified input section: X1..X5 + y + Month/Year + ADD button
-# - store-data (dcc.Store) is the single source of truth -> ADD triggers refresh
-# - Timeframe: MAX / 2Y / 1Y / 6M / 3M
-# - Normalise inputs (optional): applies to calibration + overrides (Y stays level)
-# - Seasonal Adjust (optional): adjusts actual & prediction + residual
-# - Bollinger Bands (optional): shaded band between yhat ± k*σ(resid)
-# - Polynomial model improved (deg2 + pruning pvalue)
-# - CRITICAL FIX: always add constant + align predict columns to model.exog_names
-# - Historical data table ALWAYS shown at bottom and updates on ADD
+# French EURO CPI Model — Dash (Linkers-style architecture) — UPDATED v3
+# - ADD/UPDATE: partial inputs allowed (update provided only)
+# - New rows: carry-forward last non-NaN for missing cols
+# - No dates beyond today when adding current month
+# - Historical table: Date formatted YYYY-MM-DD (no hours)
+# - Numeric formatting: ints shown as int, otherwise rounded to 2 decimals
 # ==========================================================
 
 import socket
@@ -236,7 +232,6 @@ def _apply_seasonal_adjust(
 def _exog_like_model(model, X_df: pd.DataFrame) -> pd.DataFrame:
     names = list(model.model.exog_names)
     out = pd.DataFrame(index=X_df.index)
-
     for n in names:
         if n == "const":
             out["const"] = 1.0
@@ -281,12 +276,9 @@ def _poly_backward_elimination(y: pd.Series, feats: pd.DataFrame, alpha: float =
     cols = list(feats.columns)
     removable = [c for c in cols if c not in X_COLS]  # keep linear terms always
 
-    if not removable:
-        m = sm.OLS(y.astype(float), sm.add_constant(feats[cols].astype(float), has_constant="add")).fit()
-        return m, cols
-
     while True:
-        m = sm.OLS(y.astype(float), sm.add_constant(feats[cols].astype(float), has_constant="add")).fit()
+        Xc = sm.add_constant(feats[cols].astype(float), has_constant="add")
+        m = sm.OLS(y.astype(float), Xc.astype(float)).fit()
         p = m.pvalues.drop(labels=["const"], errors="ignore")
 
         cand = [c for c in removable if c in p.index]
@@ -303,7 +295,8 @@ def _poly_backward_elimination(y: pd.Series, feats: pd.DataFrame, alpha: float =
         removable.remove(worst)
 
         if not removable:
-            m2 = sm.OLS(y.astype(float), sm.add_constant(feats[cols].astype(float), has_constant="add")).fit()
+            Xc2 = sm.add_constant(feats[cols].astype(float), has_constant="add")
+            m2 = sm.OLS(y.astype(float), Xc2.astype(float)).fit()
             return m2, cols
 
 
@@ -465,6 +458,50 @@ def _fig_residuals(idx, resid) -> go.Figure:
 
 
 # =========================
+# ✅ Table formatting helpers
+# =========================
+def _is_int_like_series(s: pd.Series) -> bool:
+    x = pd.to_numeric(s, errors="coerce").dropna()
+    if x.empty:
+        return False
+    return bool(np.all(np.isclose(x.values, np.round(x.values), atol=1e-9)))
+
+
+def _format_table_df(df_view: pd.DataFrame) -> pd.DataFrame:
+    out = df_view.copy()
+
+    if "Date" in out.columns:
+        out["Date"] = pd.to_datetime(out["Date"], errors="coerce").dt.strftime("%Y-%m-%d")
+
+    for c in out.columns:
+        if c == "Date":
+            continue
+        sc = pd.to_numeric(out[c], errors="coerce")
+        if sc.notna().any():
+            if _is_int_like_series(sc):
+                out[c] = sc.round(0).astype("Int64").astype(str).replace({"<NA>": ""})
+            else:
+                out[c] = sc.round(2).map(lambda v: "" if pd.isna(v) else f"{float(v):.2f}")
+        else:
+            out[c] = out[c].astype(str).replace({"nan": "", "NaT": ""})
+
+    return out
+
+
+# =========================
+# ✅ Carry-forward helper for missing fields on a date
+# =========================
+def _last_non_nan_before(df: pd.DataFrame, col: str, d: pd.Timestamp) -> Optional[float]:
+    if col not in df.columns:
+        return None
+    s = pd.to_numeric(df[col], errors="coerce")
+    s = s.loc[s.index < d].dropna()
+    if s.empty:
+        return None
+    return float(s.iloc[-1])
+
+
+# =========================
 # App
 # =========================
 app: Dash = dash.Dash(__name__, suppress_callback_exceptions=True)
@@ -508,12 +545,12 @@ app.layout = html.Div([
             html.Div("Scenario / Add inputs (same fields):", style={"fontWeight": 800, "marginBottom": "6px"}),
 
             html.Div([
-                num_input("x1", "Realized frxt", "(optional override / required for ADD)"),
-                num_input("x2", "% DV01 OATi issued", "(optional override / required for ADD)"),
-                num_input("x3", "Livret A net inflows", "(optional override / required for ADD)"),
-                num_input("x4", "PMI", "(optional override / required for ADD)"),
-                num_input("x5", "Roll Down (bps)", "(optional override / required for ADD)"),
-                num_input("y_new", f"{Y_COL} (for ADD)", "(required for ADD)"),
+                num_input("x1", "Realized frxt", "(optional override / optional for ADD)"),
+                num_input("x2", "% DV01 OATi issued", "(optional override / optional for ADD)"),
+                num_input("x3", "Livret A net inflows", "(optional override / optional for ADD)"),
+                num_input("x4", "PMI", "(optional override / optional for ADD)"),
+                num_input("x5", "Roll Down (bps)", "(optional override / optional for ADD)"),
+                num_input("y_new", f"{Y_COL} (for ADD)", "(optional for ADD)"),
             ]),
 
             html.Div([
@@ -596,7 +633,7 @@ app.layout = html.Div([
 
         html.Div(id="tab-content", style={"marginTop": "10px"}),
 
-        # ✅ ALWAYS visible table section at bottom
+        # ALWAYS visible table section
         html.Div([
             html.H4("Historical data (windowed & cleaned)", style={"marginBottom": "6px"}),
             html.Div(id="hist-table-note", style=DETAIL_NOTE_STYLE),
@@ -667,7 +704,7 @@ def _render_tab(tab):
 
 
 # =========================
-# ADD / UPDATE monthly data -> updates store-data (refresh everywhere)
+# ✅ ADD / UPDATE monthly data -> partial + carry-forward + no future dates
 # =========================
 @callback(
     Output("store-data", "data"),
@@ -691,9 +728,17 @@ def _add_month_data(n_clicks, store_payload, month, year, x1, x2, x3, x4, x5, y_
     if month is None or year is None:
         return no_update, html.Div("⚠️ Please select Month and Year before clicking ADD/UPDATE.", style=RED_FLAG_STYLE)
 
-    required = [x1, x2, x3, x4, x5, y_new]
-    if any(v is None for v in required):
-        return no_update, html.Div("⚠️ For ADD/UPDATE: please fill ALL 5 X inputs + y.", style=RED_FLAG_STYLE)
+    # At least one provided value
+    provided = {
+        X_COLS[0]: x1,
+        X_COLS[1]: x2,
+        X_COLS[2]: x3,
+        X_COLS[3]: x4,
+        X_COLS[4]: x5,
+        Y_COL: y_new,
+    }
+    if all(v is None for v in provided.values()):
+        return no_update, html.Div("⚠️ Please enter at least ONE value (any X or y) to add/update.", style=RED_FLAG_STYLE)
 
     try:
         df = _store_to_df(store_payload)
@@ -701,42 +746,62 @@ def _add_month_data(n_clicks, store_payload, month, year, x1, x2, x3, x4, x5, y_
     except Exception as e:
         return no_update, html.Div(f"⚠️ Store/Data error: {e}", style=RED_FLAG_STYLE)
 
-    start = pd.Timestamp(year=int(year), month=int(month), day=1)
-    if month == 12:
-        end = pd.Timestamp(year=int(year) + 1, month=1, day=1) - pd.Timedelta(days=1)
-    else:
-        end = pd.Timestamp(year=int(year), month=int(month) + 1, day=1) - pd.Timedelta(days=1)
-
-    all_days = pd.date_range(start, end, freq="D")
-    biz_days = all_days[all_days.dayofweek < 5]
-    if len(biz_days) == 0:
-        return no_update, html.Div("⚠️ No business days in this month.", style=RED_FLAG_STYLE)
-
-    new_vals = {
-        X_COLS[0]: float(x1),
-        X_COLS[1]: float(x2),
-        X_COLS[2]: float(x3),
-        X_COLS[3]: float(x4),
-        X_COLS[4]: float(x5),
-        Y_COL: float(y_new),
-    }
-
+    # Ensure required columns exist
     for c in X_COLS + [Y_COL]:
         if c not in df.columns:
             df[c] = np.nan
 
+    # Month start/end
+    start = pd.Timestamp(year=int(year), month=int(month), day=1)
+    if month == 12:
+        month_end = pd.Timestamp(year=int(year) + 1, month=1, day=1) - pd.Timedelta(days=1)
+    else:
+        month_end = pd.Timestamp(year=int(year), month=int(month) + 1, day=1) - pd.Timedelta(days=1)
+
+    # ✅ no future dates
+    today = _today()
+    effective_end = min(month_end, today)
+
+    if start > today:
+        return no_update, html.Div("⚠️ Selected month is in the future vs today — no rows created/updated.", style=RED_FLAG_STYLE)
+
+    all_days = pd.date_range(start, effective_end, freq="D")
+    biz_days = all_days[all_days.dayofweek < 5]
+    if len(biz_days) == 0:
+        return no_update, html.Div("⚠️ No business days in this month (up to today).", style=RED_FLAG_STYLE)
+
+    # convert provided non-None to floats
+    new_vals = {}
+    for k, v in provided.items():
+        if v is not None:
+            try:
+                new_vals[k] = float(v)
+            except Exception:
+                return no_update, html.Div(f"⚠️ Invalid numeric value for {k}.", style=RED_FLAG_STYLE)
+
     n_new = 0
     n_upd = 0
+    n_fill = 0  # how many carry-forwards used (roughly)
 
     for d in biz_days:
         if d in df.index:
+            # update only provided fields
             for col, val in new_vals.items():
                 df.loc[d, col] = val
             n_upd += 1
         else:
-            row = {col: np.nan for col in df.columns}
-            for col, val in new_vals.items():
-                row[col] = val
+            # create new row with carry-forward for missing fields
+            row = {}
+            for col in df.columns:
+                if col in new_vals:
+                    row[col] = new_vals[col]
+                else:
+                    prev = _last_non_nan_before(df, col, d)
+                    if prev is None:
+                        row[col] = np.nan
+                    else:
+                        row[col] = prev
+                        n_fill += 1
             df.loc[d] = row
             n_new += 1
 
@@ -744,7 +809,8 @@ def _add_month_data(n_clicks, store_payload, month, year, x1, x2, x3, x4, x5, y_
     payload = _df_to_store(df)
 
     msg = html.Div(
-        f"✅ Added {n_new} new rows and updated {n_upd} rows for {calendar.month_name[int(month)]} {int(year)}. "
+        f"✅ Month {calendar.month_name[int(month)]} {int(year)} up to {effective_end.date()} | "
+        f"New rows: {n_new} | Updated rows: {n_upd} | Carry-forward fills: ~{n_fill}. "
         f"Latest date now: {df.index.max().date()}",
         style=GREEN_FLAG_STYLE
     )
@@ -752,7 +818,7 @@ def _add_month_data(n_clicks, store_payload, month, year, x1, x2, x3, x4, x5, y_
 
 
 # =========================
-# ✅ GLOBAL Historical table callback (ALWAYS visible, updates on ADD)
+# ✅ GLOBAL Historical table callback (formatted)
 # =========================
 @callback(
     Output("hist-table", "children"),
@@ -775,11 +841,13 @@ def _update_hist_table(store_payload, window_key):
     df_view = dfw_raw.copy().reset_index()
     df_view.rename(columns={df_view.columns[0]: "Date"}, inplace=True)
 
-    note = f"Rows shown: {len(df_view)} (window={window_key}). Pagination: 25 rows/page."
+    df_view_fmt = _format_table_df(df_view)
+
+    note = f"Rows shown: {len(df_view_fmt)} (window={window_key}). Pagination: 25 rows/page."
 
     table = dash_table.DataTable(
-        columns=[{"name": c, "id": c} for c in df_view.columns],
-        data=df_view.to_dict("records"),
+        columns=[{"name": c, "id": c} for c in df_view_fmt.columns],
+        data=df_view_fmt.to_dict("records"),
         page_size=25,
         sort_action="native",
         filter_action="native",
@@ -1097,3 +1165,4 @@ if __name__ == "__main__":
     except Exception:
         pass
     app.run_server(host=host, port=port, debug=False)
+
